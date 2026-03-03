@@ -1,0 +1,173 @@
+# action.yml
+name: 'Clean Git File History'
+description: 'Remove files from git history by size threshold and/or filename patterns, while preserving the latest version in HEAD'
+author: 'kkkgo'
+branding:
+  icon: 'archive'
+  color: 'purple'
+inputs:
+  size_threshold:
+    description: 'Remove files larger than this size from history (e.g. 10M, 500K, 1G). Leave empty to skip size-based filtering.'
+    required: false
+    default: ''
+  filenames:
+    description: 'Comma-separated list of filenames or glob patterns to remove from history (e.g. *.zip,*.psd,secret.key). Leave empty to skip filename-based filtering.'
+    required: false
+    default: ''
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Validate inputs
+      shell: bash
+      run: |
+        if [ -z "${{ inputs.size_threshold }}" ] && [ -z "${{ inputs.filenames }}" ]; then
+          echo "::error::At least one of 'size_threshold' or 'filenames' must be provided."
+          exit 1
+        fi
+
+    - name: Checkout full history
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        token: ${{ github.token }}
+
+    - name: Fetch all objects
+      shell: bash
+      run: git fetch --unshallow 2>/dev/null || true
+
+    - name: Install git-filter-repo
+      shell: bash
+      run: pip install git-filter-repo --quiet
+
+    - name: Build blob ID list to strip
+      shell: bash
+      run: |
+        # ---------- Parse size threshold ----------
+        RAW="${{ inputs.size_threshold }}"
+        if [ -n "$RAW" ]; then
+          NUM=$(echo "$RAW" | sed 's/[^0-9]//g')
+          UNIT=$(echo "$RAW" | sed 's/[0-9]//g' | tr '[:lower:]' '[:upper:]')
+          case "$UNIT" in
+            K|KB) BYTES=$(( NUM * 1024 )) ;;
+            M|MB) BYTES=$(( NUM * 1024 * 1024 )) ;;
+            G|GB) BYTES=$(( NUM * 1024 * 1024 * 1024 )) ;;
+            *)    BYTES=$NUM ;;
+          esac
+          echo "Size threshold : $BYTES bytes"
+        else
+          BYTES=0
+          echo "Size threshold : disabled"
+        fi
+
+        # ---------- Parse filename patterns ----------
+        FILENAMES="${{ inputs.filenames }}"
+        if [ -n "$FILENAMES" ]; then
+          PYLIST=$(echo "$FILENAMES" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | \
+            python3 -c "import sys,json; print(json.dumps([l.strip() for l in sys.stdin if l.strip()]))")
+          echo "Filename patterns: $PYLIST"
+        else
+          PYLIST="[]"
+          echo "Filename patterns: disabled"
+        fi
+
+        # ---------- Scan all history blobs and build strip list ----------
+        echo "=== Scanning full history ==="
+        git rev-list --objects --all \
+          | git cat-file --batch-check='%(objecttype) %(objectname) %(objectsize) %(rest)' \
+          > /tmp/all_objects.txt
+        echo "Total objects : $(wc -l < /tmp/all_objects.txt)"
+        echo "Total blobs   : $(grep ^blob /tmp/all_objects.txt | wc -l)"
+
+        python3 << PYEOF
+        import fnmatch, json, subprocess
+
+        patterns  = $PYLIST
+        threshold = $BYTES
+
+        # Step 1: collect all matching blob SHAs from full history
+        to_delete = set()
+        with open('/tmp/all_objects.txt') as f:
+            for line in f:
+                parts = line.strip().split(' ', 3)
+                if len(parts) < 2 or parts[0] != 'blob':
+                    continue
+                sha      = parts[1]
+                size     = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
+                filepath = parts[3] if len(parts) > 3 else ''
+                filename = filepath.split('/')[-1] if filepath else ''
+
+                if threshold > 0 and size >= threshold:
+                    to_delete.add(sha)
+                    continue
+                if patterns and filepath:
+                    for p in patterns:
+                        if fnmatch.fnmatch(filepath, p) or fnmatch.fnmatch(filename, p):
+                            to_delete.add(sha)
+                            break
+
+        print(f"Blobs matched for deletion : {len(to_delete)}")
+
+        # Step 2: protect blobs still present in HEAD
+        result = subprocess.check_output(['git', 'ls-tree', '-r', '--long', 'HEAD']).decode()
+        protected  = set()
+        head_files = []
+        for line in result.splitlines():
+            parts = line.split()
+            if len(parts) < 5:
+                continue
+            blob_sha = parts[2]
+            size     = int(parts[3])
+            filepath = parts[4]
+            filename = filepath.split('/')[-1]
+            size_match = threshold > 0 and size >= threshold
+            name_match = any(
+                fnmatch.fnmatch(filepath, p) or fnmatch.fnmatch(filename, p)
+                for p in patterns
+            )
+            if (size_match or name_match) and blob_sha in to_delete:
+                protected.add(blob_sha)
+                head_files.append((filepath, blob_sha[:12], size))
+
+        print(f"HEAD blobs protected       : {len(protected)}")
+        for filepath, sha, size in head_files:
+            print(f"  keep  {filepath}  ({size} bytes)")
+
+        # Step 3: final strip list = matched - protected
+        final_strip = to_delete - protected
+        print(f"Blobs to actually strip    : {len(final_strip)}")
+
+        with open('/tmp/strip_ids.txt', 'w') as f:
+            f.write('\n'.join(final_strip))
+        PYEOF
+
+    - name: Run git-filter-repo
+      shell: bash
+      run: |
+        echo "=== .git size before : $(du -sh .git | cut -f1) ==="
+        echo "=== Stripping $(wc -l < /tmp/strip_ids.txt) blob(s) ==="
+
+        # --strip-blobs-with-ids is a native git-filter-repo feature:
+        # it reads one object SHA per line and removes all of them from history.
+        # No blob_callback needed — no SHA type issues.
+        git filter-repo --force --strip-blobs-with-ids /tmp/strip_ids.txt
+
+        echo "=== .git size after  : $(du -sh .git | cut -f1) ==="
+        echo "=== HEAD after       : $(git log -1 --format='%H %s') ==="
+
+    - name: Garbage collect
+      shell: bash
+      run: |
+        git reflog expire --expire=now --all
+        git gc --prune=now --aggressive
+        echo "=== .git size after GC: $(du -sh .git | cut -f1) ==="
+
+    - name: Force push
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
+      run: |
+        git remote add origin \
+          https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git
+        git push --force --all
+        git push --force --tags
