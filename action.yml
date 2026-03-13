@@ -27,7 +27,7 @@ runs:
         fi
 
     - name: Checkout full history
-      uses: actions/checkout@v4
+      uses: actions/checkout@main
       with:
         fetch-depth: 0
         token: ${{ github.token }}
