@@ -1,4 +1,3 @@
-# action.yml
 name: 'Clean Git File History'
 description: 'Remove files from git history by size threshold and/or filename patterns, while preserving the latest version in HEAD'
 author: 'kkkgo'
@@ -31,6 +30,12 @@ runs:
       with:
         fetch-depth: 0
         token: ${{ github.token }}
+        # FIX: always track the branch tip, not the workflow-trigger SHA.
+        # Without this, if a previous step (e.g. add-and-commit) pushed a new
+        # commit during this run, checkout defaults to github.sha (the original
+        # trigger SHA) and git ls-tree HEAD will miss any blobs added by that
+        # new commit, causing them to be unprotected and wiped by force-push.
+        ref: ${{ github.ref }}
 
     - name: Fetch all objects
       shell: bash
@@ -71,6 +76,15 @@ runs:
           echo "Filename patterns: disabled"
         fi
 
+        # ---------- Resolve the true HEAD SHA after any in-run pushes ----------
+        # Re-fetch origin so we see commits pushed by earlier steps in this run,
+        # then resolve the branch tip rather than relying on the stale
+        # GITHUB_SHA that was set when the workflow was first triggered.
+        git fetch origin
+        TRUE_HEAD=$(git rev-parse "refs/remotes/origin/$(git rev-parse --abbrev-ref HEAD)")
+        echo "True HEAD SHA  : $TRUE_HEAD"
+        git checkout --detach "$TRUE_HEAD"
+
         # ---------- Scan all history blobs and build strip list ----------
         echo "=== Scanning full history ==="
         git rev-list --objects --all \
@@ -108,7 +122,8 @@ runs:
 
         print(f"Blobs matched for deletion : {len(to_delete)}")
 
-        # Step 2: protect blobs still present in HEAD
+        # Step 2: protect ALL blobs still present in HEAD
+        # Uses the true branch-tip HEAD resolved above, not github.sha.
         result = subprocess.check_output(['git', 'ls-tree', '-r', '--long', 'HEAD']).decode()
         protected  = set()
         head_files = []
@@ -145,11 +160,16 @@ runs:
       shell: bash
       run: |
         echo "=== .git size before : $(du -sh .git | cut -f1) ==="
-        echo "=== Stripping $(wc -l < /tmp/strip_ids.txt) blob(s) ==="
+        STRIP_COUNT=$(grep -c . /tmp/strip_ids.txt 2>/dev/null || echo 0)
+        echo "=== Stripping ${STRIP_COUNT} blob(s) ==="
 
-        # --strip-blobs-with-ids is a native git-filter-repo feature:
-        # it reads one object SHA per line and removes all of them from history.
-        # No blob_callback needed — no SHA type issues.
+        if [ "$STRIP_COUNT" -eq 0 ]; then
+          echo "Nothing to strip, skipping git-filter-repo."
+          # Restore the branch ref that was detached above
+          git checkout -B "$(git rev-parse --abbrev-ref origin/HEAD | sed 's|origin/||')" HEAD
+          exit 0
+        fi
+
         git filter-repo --force --strip-blobs-with-ids /tmp/strip_ids.txt
 
         echo "=== .git size after  : $(du -sh .git | cut -f1) ==="
@@ -167,7 +187,10 @@ runs:
       env:
         GITHUB_TOKEN: ${{ github.token }}
       run: |
+        # Re-add origin (git-filter-repo removes it)
         git remote add origin \
+          https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git 2>/dev/null || \
+        git remote set-url origin \
           https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git
         git push --force --all
         git push --force --tags
